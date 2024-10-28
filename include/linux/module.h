@@ -75,6 +75,8 @@ extern struct module_attribute module_uevent;
 /* These are either module local, or the kernel's dummy ones. */
 extern int init_module(void);
 extern void cleanup_module(void);
+extern bool integrated_module_load_in_progress(void);
+extern void integrated_module_load_end(void);
 
 #ifndef MODULE
 /**

@@ -654,8 +654,57 @@ int devkmsg_emit(int facility, int level, const char *fmt, ...)
 	return r;
 }
 
+<<<<<<< HEAD
+=======
+static bool module_init_done_msg(const char *line, const char *match_str)
+{
+	const char *c;
+	int matched;
+
+	for (c = line, matched = 0; *c && match_str[matched]; c++) {
+		if (match_str[matched] == '#') {
+			if (*c >= '0' && *c <= '9')
+				continue;
+			matched++;
+		}
+
+		if (*c != match_str[matched++])
+			return false;
+	}
+
+	/* Check that the whole string was matched */
+	return !match_str[matched];
+}
+
+static void check_modules_init_done(const char *line)
+{
+	static const char *const init_done_msgs[] = {
+		"init: Loaded # modules from",
+		"init: Loaded # kernel modules took"
+	};
+	int i;
+
+	/*
+	 * Android emits, e.g., "init: Loaded 195 modules from /lib/modules"
+	 * after its finished loading all modules. For integrated modules, use
+	 * this as a signal to know when the big pile of modules is finished
+	 * loading in order to kick off probing all of those modules' drivers.
+	 */
+	for (i = 0; i < ARRAY_SIZE(init_done_msgs); i++) {
+		if (module_init_done_msg(line, init_done_msgs[i]))
+			break;
+	}
+
+	if (i == ARRAY_SIZE(init_done_msgs))
+		return;
+
+	integrated_module_load_end();
+}
+
+>>>>>>> 94aa14943f78 (kernel: Support integrated module loading from first stage init)
 static ssize_t devkmsg_write(struct kiocb *iocb, struct iov_iter *from)
 {
+	bool check_integrated_modules = false;
 	char *buf, *line;
 	int level = default_message_loglevel;
 	int facility = 1;	/* LOG_USER */
@@ -667,6 +716,16 @@ static ssize_t devkmsg_write(struct kiocb *iocb, struct iov_iter *from)
 	if (!user || len > LOG_LINE_MAX)
 		return -EINVAL;
 
+<<<<<<< HEAD
+=======
+	/* We need to see Android's message that it's done loading modules */
+	if (IS_ENABLED(CONFIG_INTEGRATE_MODULES) && is_global_init(current) &&
+	    integrated_module_load_in_progress()) {
+		check_integrated_modules = true;
+		goto skip_checks;
+	}
+
+>>>>>>> 94aa14943f78 (kernel: Support integrated module loading from first stage init)
 	/* Ignore when user logging is disabled. */
 	if (devkmsg_log & DEVKMSG_LOG_MASK_OFF)
 		return len;
@@ -711,6 +770,12 @@ static ssize_t devkmsg_write(struct kiocb *iocb, struct iov_iter *from)
 		}
 	}
 
+<<<<<<< HEAD
+=======
+	if (unlikely(check_integrated_modules))
+		check_modules_init_done(line);
+
+>>>>>>> 94aa14943f78 (kernel: Support integrated module loading from first stage init)
 	devkmsg_emit(facility, level, "%s", line);
 	kfree(buf);
 	return ret;
