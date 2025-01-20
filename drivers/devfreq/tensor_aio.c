@@ -294,11 +294,42 @@ static void calc_cntpct_arith(void)
 	cpu_min_sample_cntpct = ns_to_cntpct(cpu_min_sample_cntpct);
 }
 
+enum cpu_throttle_src {
+	CPU_CPUFREQ_THROTTLE,
+	CPU_HW_THROTTLE,
+#ifdef CONFIG_SOC_ZUMA
+	CPU_TMU_THROTTLE,
+#endif
+	MAX_CPU_THROTTLE_SRCS
+};
+
+struct throt_data {
+	struct list_head node;
+	raw_spinlock_t throt_lock;
+	raw_spinlock_t idle_cpu_lock;
+	struct exynos_cpufreq_domain *domain;
+	unsigned int cap[MAX_CPU_THROTTLE_SRCS];
+	unsigned int idle_cpus;
+	unsigned int nr_domain_cpus;
+	u64 last_htd_cntpct;
+	int cpu;
+};
+
+/*
+ * domain_throt_data is guaranteed to be initialized for all CPUs before Tensor
+ * AIO starts because tensor_aio_init_cpu_domain() is called during cpufreq init
+ * in exynos-acme, and the cache_cpu_policy() check in our probe routine forces
+ * probing to be deferred until all CPUs are registered with cpufreq.
+ */
+static DEFINE_PER_CPU_READ_MOSTLY(struct throt_data *, domain_throt_data);
+static LIST_HEAD(domain_throt_list);
+
 enum pmu_events {
 	CPU_CYCLES,
 	STALL_BACKEND_MEM,
 	PMU_EVT_MAX
 };
+
 
 static const u32 pmu_evt_id[PMU_EVT_MAX] = {
 	[CPU_CYCLES] = ARMV8_PMUV3_PERFCTR_CPU_CYCLES,
@@ -728,21 +759,33 @@ static u32 find_cpu_freq(struct cpufreq_policy *pol, u64 khz, u32 relation)
 	return tbl[idx].frequency;
 }
 
-static void update_thermal_pressure(void)
+/* Must be called with t->throt_lock held */
+static void update_thermal_pressure(struct throt_data *t,
+				    enum cpu_throttle_src src, unsigned int cap)
 {
-#ifdef CONFIG_SOC_ZUMA
-	unsigned int gs_tmu_throt_freq(int cpu);
-	int cpu = raw_smp_processor_id();
-	struct cpufreq_policy *pol = cpufreq_cpu_get_raw(cpu);
-	unsigned long capped_freq;
+	unsigned int capped_freq = UINT_MAX;
+	int i;
 
-	if (unlikely(!pol))
+	/*
+	 * Update the thermal pressure for the designated source if it's
+	 * different, and then aggregate the thermal pressure applied by all
+	 * sources. This updates all CPUs within the same clock domain.
+	 */
+	if (t->cap[src] == cap)
 		return;
 
-	/* Refresh the thermal pressure with the TMU's current throttle freq */
-	capped_freq = min(gs_tmu_throt_freq(cpu), pol->max);
-	arch_update_thermal_pressure(cpumask_of(cpu), capped_freq);
-#endif
+	t->cap[src] = cap;
+
+	/* Aggregate min cap across sources */
+	for (i = 0; i < MAX_CPU_THROTTLE_SRCS; i++)
+		capped_freq = min(capped_freq, t->cap[i]);
+
+	/*
+	 * If capped_freq remains UINT_MAX, there's no applied throttle; leave
+	 * it as UINT_MAX to indicate "no cap". arch_update_thermal_pressure
+	 * must interpret UINT_MAX appropriately (i.e. as no throttling).
+	 */
+	arch_update_thermal_pressure(cpumask_of(t->cpu), capped_freq);
 }
 
 /* The sfd helpers must be called with sfd->lock held */
@@ -886,6 +929,30 @@ static struct scale_freq_data tensor_aio_sfd = {
 	.set_freq_scale = tensor_aio_tick
 };
 
+<<<<<<< HEAD
+=======
+static void set_cpu_hw_throttle_idle(int cpu, bool idle)
+{
+	struct throt_data *t = per_cpu(domain_throt_data, cpu);
+
+	raw_spin_lock(&t->idle_cpu_lock);
+	if (idle) {
+		/*
+		 * Clear the measured hardware throttle for the CPU domain when
+		 * all CPUs in the domain are idle.
+		 */
+		if (++t->idle_cpus == t->nr_domain_cpus) {
+			raw_spin_lock(&t->throt_lock);
+			update_thermal_pressure(t, CPU_HW_THROTTLE, UINT_MAX);
+			raw_spin_unlock(&t->throt_lock);
+		}
+	} else {
+		t->idle_cpus--;
+	}
+	raw_spin_unlock(&t->idle_cpu_lock);
+}
+
+>>>>>>> 613232f69c44 (tensor_aio: Replace idle_cpus cpumask with a simple counter)
 static void tensor_aio_cpu_idle(int cpu, bool idle)
 {
 	struct cpu_pmu *pmu = &per_cpu(cpu_pmu_evs, cpu);
@@ -1053,8 +1120,16 @@ static void tensor_aio_schedule(void *data, unsigned int sched_mode,
 
 static int tensor_aio_idle_init(void *unused)
 {
-	/* All CPUs are guaranteed to not be in the idle task right now */
+	struct throt_data *t;
+
+	/*
+	 * All CPUs are guaranteed to not be in the idle task right now. Reset
+	 * the counts for the number of idle CPUs since they may be overflowed.
+	 */
 	idle_task_cpus = 0;
+	list_for_each_entry(t, &domain_throt_list, node)
+		t->idle_cpus = 0;
+
 	return 0;
 }
 
@@ -1188,12 +1263,15 @@ static void memperfd_init(void)
 	BUG_ON(register_trace_android_rvh_tick_entry(tensor_aio_tick_entry,
 						     NULL));
 
-	/*
-	 * Stop all online CPUs in order to register the idle-task CPUs tracker,
-	 * so that it starts out with all CPUs non-idle and thus can keep an
-	 * accurate count of the number of CPUs inside the idle task.
-	 */
+	/* Register the idle-task CPUs tracker for quiescing memperfd */
 	BUG_ON(register_trace_android_rvh_schedule(tensor_aio_schedule, NULL));
+
+	/*
+	 * Stop all online CPUs in order to initialize the idle-task CPUs
+	 * tracker and thermal throttle domain idle CPUs tracker with the
+	 * correct number of idle CPUs. When tensor_aio_idle_init() runs, it
+	 * runs with all CPUs guaranteed to not be running inside the idle task.
+	 */
 	BUG_ON(stop_machine(tensor_aio_idle_init, NULL, NULL));
 }
 
